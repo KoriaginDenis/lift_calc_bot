@@ -1,117 +1,170 @@
 # bot.py
 
+import os
+import re
 import logging
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, Document
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+)
+
 from calculator import calculate_montage_price
 
 logging.basicConfig(level=logging.INFO)
 
-# Состояния диалога
-(
-    TYPING_EQUIP_COST,
-    ASK_MACHINE_ROOM,
-    ASK_SHAFT_TYPE,
-    ASK_REPLACEMENT,
-    ASK_DOORS,
-    ASK_PLATFORMS,
-    ASK_DISPATCHER,
-    ASK_REGION
-) = range(8)
+TOKEN = os.getenv("BOT_TOKEN") or "вставь_свой_токен_сюда"
 
+# Шаги сценария
+PDF, REGION, REPLACEMENT, PASS_THROUGH, DOORS_MORE, DISPATCH, EXTRA_QUESTIONS = range(7)
+
+# Временное хранилище данных по пользователю
 user_data = {}
 
+# ==== PDF ОБРАБОТКА ====
+
+def parse_pdf_text(text):
+    # Упрощённый парсинг
+    result = {
+        "lift_type": "пассажирский" if "пассажир" in text.lower() else "грузовой",
+        "machine_room": "без машинного помещения" not in text.lower(),
+        "stops": int(re.search(r"(\d+)\s*останов", text.lower()).group(1)) if re.search(r"(\d+)\s*останов", text.lower()) else 0,
+        "height": float(re.search(r"(\d+[.,]?\d*)\s*м", text.lower()).group(1).replace(',', '.')) if re.search(r"(\d+[.,]?\d*)\s*м", text.lower()) else 0,
+        "fire_mode": "рппп" in text.lower(),
+        "equipment_price": float(re.search(r"([\d\s]+)\s*руб", text.lower()).group(1).replace(' ', '')) if re.search(r"([\d\s]+)\s*руб", text.lower()) else 0
+    }
+    return result
+
+# ==== СЦЕНАРИЙ ====
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите стоимость оборудования в рублях:")
-    return TYPING_EQUIP_COST
+    await update.message.reply_text("Отправьте PDF-файл со сметой или ТЗ.")
+    return PDF
 
-async def equipment_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        price = float(update.message.text.replace(' ', '').replace(',', '.'))
-        user_data[update.message.chat_id] = {"price": price}
-        reply = ReplyKeyboardMarkup([["Да", "Нет"]], one_time_keyboard=True)
-        await update.message.reply_text("Есть машинное помещение?", reply_markup=reply)
-        return ASK_MACHINE_ROOM
-    except:
-        await update.message.reply_text("Введите число. Например: 950000")
-        return TYPING_EQUIP_COST
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file: Document = update.message.document
+    if not file.file_name.endswith(".pdf"):
+        await update.message.reply_text("Пожалуйста, отправьте именно PDF-файл.")
+        return PDF
 
-async def machine_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data[update.message.chat_id]["no_machine_room"] = (update.message.text == "Нет")
-    reply = ReplyKeyboardMarkup([["монолит", "металлическая", "кирпичная"]], one_time_keyboard=True)
-    await update.message.reply_text("Тип шахты?", reply_markup=reply)
-    return ASK_SHAFT_TYPE
+    file_path = await file.get_file()
+    pdf_bytes = await file_path.download_as_bytearray()
 
-async def shaft_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data[update.message.chat_id]["shaft_type"] = update.message.text
-    reply = ReplyKeyboardMarkup([["Замена", "Новостройка"]], one_time_keyboard=True)
-    await update.message.reply_text("Тип объекта?", reply_markup=reply)
-    return ASK_REPLACEMENT
+    import fitz  # PyMuPDF
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = "\n".join(page.get_text() for page in doc)
 
-async def replacement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data[update.message.chat_id]["replacement"] = (update.message.text == "Замена")
-    reply = ReplyKeyboardMarkup([["Да", "Нет"]], one_time_keyboard=True)
-    await update.message.reply_text("Кабина проходная? (дверей больше, чем остановок)", reply_markup=reply)
-    return ASK_DOORS
+    parsed = parse_pdf_text(full_text)
+    user_data[update.effective_chat.id] = parsed
 
-async def doors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data[update.message.chat_id]["more_doors"] = (update.message.text == "Да")
-    reply = ReplyKeyboardMarkup([["Мы", "Застройщик"]], one_time_keyboard=True)
-    await update.message.reply_text("Кто делает настилы?", reply_markup=reply)
-    return ASK_PLATFORMS
-
-async def platforms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data[update.message.chat_id]["we_do_platforms"] = (update.message.text == "Мы")
-    reply = ReplyKeyboardMarkup([["Базовая", "IP", "Без диспетчеризации"]], one_time_keyboard=True)
-    await update.message.reply_text("Тип диспетчеризации?", reply_markup=reply)
-    return ASK_DISPATCHER
-
-async def dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data[update.message.chat_id]["dispatcher"] = update.message.text
-    reply = ReplyKeyboardMarkup([["СПб", "Регион"]], one_time_keyboard=True)
-    await update.message.reply_text("Где находится объект?", reply_markup=reply)
-    return ASK_REGION
-
-async def region(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data[update.message.chat_id]["region"] = (update.message.text == "Регион")
-
-    params = user_data[update.message.chat_id]
-    price = params.pop("price")
-
-    result = calculate_montage_price(price, params)
-
-    breakdown = "\n".join(
-        f"{label}: +{int(minv):,} — +{int(maxv):,} ₽" for label, minv, maxv in result["adjustments"]
+    await update.message.reply_text(
+        "Выберите регион:",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Санкт-Петербург"], ["Ленинградская область"], ["Другой регион"]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        ),
     )
-    base = result["base"]
-    total = result["total"]
+    return REGION
 
-    reply_text = (
-        f"💰 *Предварительная стоимость монтажа:*\n"
-        f"Базовая оценка: {int(base[0]):,} — {int(base[1]):,} ₽\n"
-        f"\n📋 *Корректировки:*\n{breakdown}\n\n"
-        f"📦 *Итого:* _{int(total[0]):,} — {int(total[1]):,} ₽_"
+async def set_region(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    region = update.message.text.lower()
+    chat_id = update.effective_chat.id
+    user_data[chat_id]["region"] = (
+        "СПб" if "петербург" in region else "ЛО" if "ленинград" in region else "регион"
     )
 
-    await update.message.reply_text(reply_text, parse_mode="Markdown")
+    await update.message.reply_text(
+        "Это замена или новостройка?",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Замена"], ["Новое строительство"]], one_time_keyboard=True, resize_keyboard=True
+        ),
+    )
+    return REPLACEMENT
+
+async def set_replacement(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data[update.effective_chat.id]["is_new_building"] = "новое" in update.message.text.lower()
+
+    await update.message.reply_text(
+        "Кабина проходная?",
+        reply_markup=ReplyKeyboardMarkup([["Да"], ["Нет"]], one_time_keyboard=True, resize_keyboard=True),
+    )
+    return PASS_THROUGH
+
+async def set_pass_through(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data[update.effective_chat.id]["pass_through"] = update.message.text.lower() == "да"
+
+    await update.message.reply_text(
+        "Количество дверей превышает количество остановок?",
+        reply_markup=ReplyKeyboardMarkup([["Да"], ["Нет"]], one_time_keyboard=True, resize_keyboard=True),
+    )
+    return DOORS_MORE
+
+async def set_doors_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data[update.effective_chat.id]["doors_more_than_stops"] = update.message.text.lower() == "да"
+
+    await update.message.reply_text(
+        "Тип диспетчеризации?",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Объект без ПК"], ["Объект с ПК"], ["Кристалл"], ["Без диспетчеризации"]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        ),
+    )
+    return DISPATCH
+
+async def set_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data[update.effective_chat.id]["dispatcher"] = update.message.text
+
+    await update.message.reply_text("Остальные уточнения пока пропущены — расчёт выполняется...")
+
+    return await finalize(update, context)
+
+async def finalize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    data = user_data.get(chat_id, {})
+
+    result = calculate_montage_price(data)
+
+    lines = [f"💰 *Расчёт стоимости монтажа лифта*"]
+    lines.append(f"\n*Базовая стоимость:* `{int(result['base_total'])} ₽`")
+
+    if result["adjustments"]:
+        lines.append(f"\n*Надбавки:*")
+        for name, val in result["adjustments"]:
+            lines.append(f"— {name}: `{int(val)} ₽`")
+
+    if result["estimated_70_percent"]:
+        lines.append(f"\n📊 *Оценка 70% от оборудования:* `{int(result['estimated_70_percent'])} ₽`")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
     return ConversationHandler.END
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+# ==== ЗАПУСК ====
+
 def main():
-    app = ApplicationBuilder().token("7926960422:AAH-OFVzhcdE4gm0KgSuMn9JRxIxSTUrtw0").build()
+    app = ApplicationBuilder().token(TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            TYPING_EQUIP_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, equipment_cost)],
-            ASK_MACHINE_ROOM: [MessageHandler(filters.TEXT, machine_room)],
-            ASK_SHAFT_TYPE: [MessageHandler(filters.TEXT, shaft_type)],
-            ASK_REPLACEMENT: [MessageHandler(filters.TEXT, replacement)],
-            ASK_DOORS: [MessageHandler(filters.TEXT, doors)],
-            ASK_PLATFORMS: [MessageHandler(filters.TEXT, platforms)],
-            ASK_DISPATCHER: [MessageHandler(filters.TEXT, dispatcher)],
-            ASK_REGION: [MessageHandler(filters.TEXT, region)],
+            PDF: [MessageHandler(filters.Document.PDF, handle_pdf)],
+            REGION: [MessageHandler(filters.TEXT, set_region)],
+            REPLACEMENT: [MessageHandler(filters.TEXT, set_replacement)],
+            PASS_THROUGH: [MessageHandler(filters.TEXT, set_pass_through)],
+            DOORS_MORE: [MessageHandler(filters.TEXT, set_doors_more)],
+            DISPATCH: [MessageHandler(filters.TEXT, set_dispatch)],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     app.add_handler(conv)
