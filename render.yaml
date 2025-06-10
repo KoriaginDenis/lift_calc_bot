@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: lift-calc-bot
+    runtime: python
+    plan: free
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        value: 7926960422:AAH-OFVzhcdE4gm0KgSuMn9JRxIxSTUrtw0
